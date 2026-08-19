@@ -32,6 +32,17 @@ from nsepythonserver import nse_optionchain_scrapper, nsefetch
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE_SECONDS = 3  # 3s, 6s, 12s...
 
+# Deliberate pause after EVERY successful NSE call, regardless of which
+# function made it. A single run makes up to ~7 calls (1 index snapshot +
+# 3 symbols x 2 calls each) in rapid succession -- live testing showed the
+# FIRST call in a run succeeding with real data while every call after it
+# came back as an empty {} (not an error, not a block page -- just
+# nothing). That pattern points to NSE rate-limiting bursts of requests
+# from the same session/IP within a short window, not a blanket block.
+# Spacing calls out is the cheap first thing to try before assuming a
+# harder infrastructure fix (self-hosted runner, proxy) is needed.
+SLEEP_BETWEEN_CALLS_SECONDS = 4
+
 # Fallback lot sizes, used only if the live futures response doesn't carry
 # a parseable lot size. Current as of the January 2026 NSE revision --
 # check https://www.nseindia.com/all-reports-derivatives (lot size circular)
@@ -57,11 +68,19 @@ INDIA_VIX_DISPLAY_NAME = "INDIA VIX"
 def _retry(fn, *args, what: str, **kwargs):
     """Generic retry wrapper with exponential backoff. Re-raises the last
     exception if all attempts fail, so the caller can decide how to log/
-    skip; this function's only job is to absorb TRANSIENT failures."""
+    skip; this function's only job is to absorb TRANSIENT failures.
+
+    Also pauses SLEEP_BETWEEN_CALLS_SECONDS after every successful call --
+    see the constant's comment above for why. This means every NSE-hitting
+    function in this module (fetch_option_chain, fetch_futures_raw,
+    fetch_index_snapshot_raw) is automatically spaced out, without callers
+    needing to remember to add their own delays between calls."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            return fn(*args, **kwargs)
+            result = fn(*args, **kwargs)
+            time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
+            return result
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < MAX_RETRIES:
