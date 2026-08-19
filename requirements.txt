@@ -1,1 +1,1 @@
-nsepython
+nsepythonserver
