@@ -100,6 +100,12 @@ def process_symbol(symbol: str, fetch_ts_utc: datetime, fetch_ts_ist: datetime,
 
     option_chain_raw = nse_fetch.fetch_option_chain(symbol)
 
+    if not option_chain_raw or "records" not in option_chain_raw:
+        status["option_chain"] = "empty_response"
+        gha_warning(f"[{symbol}] option chain came back as an empty/unexpected response "
+                    f"(no 'records' key) -- this symbol will fail its freshness check "
+                    f"this cycle. Raw response still archived for inspection.")
+
     records = option_chain_raw.get("records", {})
     underlying_value = records.get("underlyingValue")
     data = records.get("data", [])
