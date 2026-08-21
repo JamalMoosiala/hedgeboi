@@ -1,62 +1,94 @@
 """
 nse_fetch.py
 
-All calls to NSE's unofficial JSON endpoints, wrapped with retries so a
-transient blip on NSE's side (or a rate-limit hiccup) doesn't kill an
-entire run. Every function here can raise -- callers are expected to catch
-per-symbol, not let one bad symbol take down the others (see run_fetch.py).
+Plain `requests`-based client for NSE's public JSON endpoints -- no
+nsepython/nsepythonserver dependency. This was a deliberate rewrite after
+live debugging showed:
 
-NOTE ON RELIABILITY: nse_optionchain_scrapper (option chain) is the most
-battle-tested of these, widely used by the nsepython community. The
-futures endpoint (quote-derivative) and the index-snapshot endpoint
-(allIndices) are used here directly via nsefetch and are more likely to
-have their exact JSON key names drift over time, since they see less
-community-maintenance attention. If lot_size or futures_price start
-showing up as None across the board, that's the first place to check --
-open https://www.nseindia.com/api/quote-derivative?symbol=NIFTY (or
-allIndices) in a browser and diff the JSON shape against the parsing
-below.
+1. The classic option-chain endpoint (option-chain-indices) returns an
+   empty {} even when hit directly, from BOTH a GitHub Actions cloud
+   runner AND a residential IP -- it's very likely simply retired on
+   NSE's side, not "blocked."
+2. A newer endpoint (NextApi/apiClient/GetQuoteApi, functionName=
+   getSymbolDerivativesData) DOES return real, live, full option-chain
+   data -- confirmed with live output during debugging. nse_optionchain_
+   scrapper() (from nsepython/nsepythonserver) apparently wraps this
+   endpoint internally but its own reshaping logic was returning {}
+   regardless -- a library bug, not an NSE/IP problem.
+3. This project's own bhavcopy downloader (scraper.py) has been reliably
+   pulling NSE data from GitHub Actions the whole time, using nothing
+   more exotic than: a requests.Session(), a real browser User-Agent, and
+   visiting nseindia.com first to collect cookies before hitting the
+   actual target URL. This module ports that exact proven pattern to the
+   live API endpoints instead of assuming a special cloud-workaround
+   library was ever necessary.
+
+IMPORTANT DATA LIMITATION: the working option-chain endpoint above does
+NOT include bid/ask (no live two-sided quote) or NSE's own published IV.
+Both were available from the old (now-dead) endpoint. This means:
+- IV/Greeks are solved from LTP only -- there's no mid-price to prefer
+  over it anymore, since there's no bid/ask at all.
+- The below-intrinsic-value guardrail in greeks.implied_vol() is now the
+  ONLY protection against a bad price -- it still works fine (only needs
+  LTP), it just can't distinguish "thin/wide quote" from "no quote"
+  anymore, since there's no quote to inspect.
+- nse_iv is always None going forward -- the cross-check column has
+  nothing to cross-check against with this data source.
+See run_fetch.py and the README data dictionary for how this is reflected
+in the output columns.
 """
 
 import time
+from datetime import datetime
 
-# IMPORTANT: nsepythonserver, not nsepython. nsepython's own docs split
-# into a "Local Edition" (laptops) and a "Server Edition" for cloud/
-# datacenter IPs (AWS, Google Colab, DigitalOcean) -- GitHub Actions
-# runners are the same class of infrastructure, and NSE's anti-bot layer
-# silently returns empty/invalid responses to nsepython's local edition
-# from these IP ranges. If function names ever diverge between the two
-# packages in a future nsepython release, this is the first place to check.
-from nsepythonserver import nse_optionchain_scrapper, nsefetch
+import requests
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE_SECONDS = 3  # 3s, 6s, 12s...
+SLEEP_BETWEEN_CALLS_SECONDS = 2  # politeness delay after every successful call
 
-# Deliberate pause after EVERY successful NSE call, regardless of which
-# function made it. A single run makes up to ~7 calls (1 index snapshot +
-# 3 symbols x 2 calls each) in rapid succession -- live testing showed the
-# FIRST call in a run succeeding with real data while every call after it
-# came back as an empty {} (not an error, not a block page -- just
-# nothing). That pattern points to NSE rate-limiting bursts of requests
-# from the same session/IP within a short window, not a blanket block.
-# Spacing calls out is the cheap first thing to try before assuming a
-# harder infrastructure fix (self-hosted runner, proxy) is needed.
-SLEEP_BETWEEN_CALLS_SECONDS = 4
+BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Connection": "keep-alive",
+}
 
-# Fallback lot sizes, used only if the live futures response doesn't carry
-# a parseable lot size. Current as of the January 2026 NSE revision --
-# check https://www.nseindia.com/all-reports-derivatives (lot size circular)
-# periodically and update this table when NSE next revises lot sizes.
+WARMUP_URL = "https://www.nseindia.com/option-chain"
+
+OPTION_CHAIN_URL = (
+    "https://www.nseindia.com/api/NextApi/apiClient/GetQuoteApi"
+    "?functionName=getSymbolDerivativesData&symbol={symbol}"
+)
+OPTION_CHAIN_V3_URL = (
+    "https://www.nseindia.com/api/option-chain-v3?type=Indices&symbol={symbol}&expiry={expiry}"
+)
+ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
+
+# quote-derivative is CONFIRMED DEAD -- every URL shape tried against it
+# (bare symbol, symbol+identifier, identifier only) returned a genuine
+# HTTP 404 "Resource not found" during live debugging, not an empty
+# response or a block. It used to be this pipeline's source for both
+# futures prices AND lot size. Futures now come from
+# parse_futures_from_entries() (see above, uses the option-chain response
+# itself). Lot size has NO live source at all anymore -- LOT_SIZE_FALLBACK
+# below is the only source, full stop, until/unless a replacement
+# endpoint is found.
+
+# Fallback lot sizes -- current as of the January 2026 NSE revision
+# (NIFTY 65, BANKNIFTY 30, NIFTYNXT50 25). Re-check
+# https://www.nseindia.com/all-reports-derivatives periodically and
+# update this table when NSE next revises lot sizes, since there's no
+# longer any live endpoint to catch a revision automatically.
 LOT_SIZE_FALLBACK = {
     "NIFTY": 65,
     "BANKNIFTY": 30,
     "NIFTYNXT50": 25,
 }
 
-# NSE's display names for these indices on the allIndices endpoint. If the
-# index-snapshot fetch starts returning None for a symbol, the likely cause
-# is NSE having renamed the index slightly -- check the raw allIndices
-# response and update these strings.
 INDEX_DISPLAY_NAME = {
     "NIFTY": "NIFTY 50",
     "BANKNIFTY": "NIFTY BANK",
@@ -64,17 +96,30 @@ INDEX_DISPLAY_NAME = {
 }
 INDIA_VIX_DISPLAY_NAME = "INDIA VIX"
 
+_session = None  # module-level, lazily created, reused across all calls in a run
+
+
+def _get_session() -> requests.Session:
+    """
+    Creates (once per script run) or returns the shared session. Warms it
+    up by visiting the option-chain page first, exactly like the bhavcopy
+    downloader visits the homepage first -- this is what actually
+    populates the cookies NSE's API checks for.
+    """
+    global _session
+    if _session is not None:
+        return _session
+
+    session = requests.Session()
+    session.headers.update(BASE_HEADERS)
+    session.get(WARMUP_URL, timeout=15)
+    _session = session
+    return _session
+
 
 def _retry(fn, *args, what: str, **kwargs):
-    """Generic retry wrapper with exponential backoff. Re-raises the last
-    exception if all attempts fail, so the caller can decide how to log/
-    skip; this function's only job is to absorb TRANSIENT failures.
-
-    Also pauses SLEEP_BETWEEN_CALLS_SECONDS after every successful call --
-    see the constant's comment above for why. This means every NSE-hitting
-    function in this module (fetch_option_chain, fetch_futures_raw,
-    fetch_index_snapshot_raw) is automatically spaced out, without callers
-    needing to remember to add their own delays between calls."""
+    """Generic retry wrapper with exponential backoff, plus a politeness
+    pause after every successful call (see SLEEP_BETWEEN_CALLS_SECONDS)."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -91,59 +136,156 @@ def _retry(fn, *args, what: str, **kwargs):
     raise last_exc
 
 
+def _get_json(url: str, what: str, referer: str = None) -> dict:
+    session = _get_session()
+    headers = {"Referer": referer} if referer else {}
+
+    def _do_request():
+        resp = session.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        return resp.json()
+
+    return _retry(_do_request, what=what)
+
+
+# ---------------------------------------------------------------------------
+# Option chain (flat per-contract entries -- see module docstring)
+# ---------------------------------------------------------------------------
+
 def fetch_option_chain(symbol: str) -> dict:
-    """Spot + full option chain, in one call -- this is what keeps spot and
-    option quotes synchronized to the same moment."""
-    return _retry(nse_optionchain_scrapper, symbol, what=f"option_chain:{symbol}")
+    """
+    Returns the raw response: {"data": [...flat entries...], "timestamp": ...}.
+    Each entry in "data" is ONE contract leg. Most are options (CE/PE), but
+    a handful are the underlying's own FUTURES contracts, distinguished by
+    instrumentType starting with "FUT" (e.g. FUTIDX for index futures,
+    presumably FUTSTK for stock futures) rather than "OPTIDX"/"OPTSTK".
+    This means a single call covers both options AND futures -- see
+    parse_futures_from_entries() below, which replaces what used to be a
+    separate call to the (now confirmed dead, 404s on every URL shape
+    tried) quote-derivative endpoint.
+    """
+    url = OPTION_CHAIN_URL.format(symbol=symbol)
+    return _get_json(url, what=f"option_chain:{symbol}", referer=WARMUP_URL)
 
 
-def fetch_futures_raw(symbol: str) -> dict:
-    """Raw quote-derivative response for a symbol's futures contracts."""
-    url = f"https://www.nseindia.com/api/quote-derivative?symbol={symbol}"
-    return _retry(nsefetch, url, what=f"futures:{symbol}")
+def flatten_v3_entries(v3_raw: dict) -> list:
+    """
+    Converts option-chain-v3's nested per-strike {CE: {...}, PE: {...}}
+    structure into a flat list of one dict per option leg, tagged with
+    option_type and a consistent-format expiry (the per-strike-entry
+    "expiryDates" field, DD-Mon-YYYY -- NOT the inner leg's own
+    "expiryDate" field, which uses a different DD-MM-YYYY format on this
+    endpoint; using the outer one keeps expiry formatting consistent with
+    every other date field in this pipeline).
+    """
+    records = (v3_raw or {}).get("records", {})
+    entries = records.get("data", [])
+    flat = []
+    for entry in entries:
+        strike = entry.get("strikePrice")
+        expiry_outer = entry.get("expiryDates")
+        for opt_type in ("CE", "PE"):
+            leg = entry.get(opt_type)
+            if not leg:
+                continue
+            leg = dict(leg)
+            leg["option_type"] = opt_type
+            leg["strikePrice"] = strike
+            leg["expiryDates"] = expiry_outer
+            flat.append(leg)
+    return flat
 
 
-def parse_futures(raw: dict) -> dict:
-    """Returns {expiry_date_str: futures_price} from a quote-derivative response."""
+def parse_futures_from_entries(entries: list) -> dict:
+    """
+    Returns {expiry_date_str: futures_price}, built from the SAME entries
+    list returned by fetch_option_chain() -- filtering for futures
+    contracts rather than a separate API call. Confirmed live: NIFTY's
+    response includes ~3 futures entries (near/next/far month) alongside
+    the option entries, with strikePrice "0.00" and optionType "XX" as
+    placeholders (they're not real options, just tagged the same way).
+    """
     futures = {}
-    for item in raw.get("stocks", []):
-        meta = item.get("metadata", {})
-        instrument = meta.get("instrumentType", "")
-        if "Futures" in instrument:
-            expiry = meta.get("expiryDate")
-            ltp = meta.get("lastPrice")
+    for entry in entries:
+        instrument = entry.get("instrumentType", "")
+        if instrument.startswith("FUT"):
+            expiry = entry.get("expiryDate")
+            ltp = entry.get("lastPrice")
             if expiry and ltp:
                 futures[expiry] = ltp
     return futures
 
 
-def parse_lot_size(raw: dict, symbol: str) -> int:
-    """Tries a couple of plausible key locations for lot size in the
-    quote-derivative response; falls back to the static table if none work."""
-    for item in raw.get("stocks", []):
-        meta = item.get("metadata", {})
-        for key in ("lotSize", "marketLot"):
-            val = meta.get(key)
-            if val:
-                return int(val)
-        trade_info = item.get("marketDeptOrderBook", {}).get("tradeInfo", {})
-        for key in ("marketLot", "lotSize"):
-            val = trade_info.get(key)
-            if val:
-                return int(val)
-    return LOT_SIZE_FALLBACK.get(symbol)
+# ---------------------------------------------------------------------------
+# option-chain-v3: the endpoint with real bid/ask and NSE's own IV.
+#
+# CONFIRMED LIVE: requires an explicit &expiry= param -- omitting it
+# returns HTTP 200 but completely empty records (no data, no metadata at
+# all). When a VALID expiry is supplied, the response also includes the
+# FULL list of every expiry NSE has for that symbol under
+# records.expiryDates -- so one call with any known-good expiry doubles
+# as a way to discover every other valid expiry.
+#
+# Two-step fetch, per symbol, per cycle:
+#   1. Bootstrap: use a guaranteed-valid expiry string from
+#      fetch_option_chain() (the flat endpoint, already proven reliable)
+#      to make the first v3 call. This also hands back the full expiry list.
+#   2. Target: from that list, pick the nearest MONTHLY expiry (see
+#      pick_nearest_monthly_expiry below) and, if it differs from the
+#      bootstrap expiry, make one more v3 call for it. If the bootstrap
+#      expiry already IS the nearest monthly, no second call is needed.
+# ---------------------------------------------------------------------------
 
+def fetch_option_chain_v3(symbol: str, expiry: str) -> dict:
+    url = OPTION_CHAIN_V3_URL.format(symbol=symbol, expiry=expiry)
+    return _get_json(url, what=f"option_chain_v3:{symbol}:{expiry}", referer=WARMUP_URL)
+
+
+def pick_nearest_monthly_expiry(expiry_dates: list, as_of_date) -> str:
+    """
+    NSE lists both weekly and monthly expiries together with no explicit
+    tag distinguishing them. The monthly contract for a given calendar
+    month is, by convention, the LAST (latest) expiry date that falls in
+    that month -- weeklies fill in the earlier Tuesdays. This groups the
+    given expiry_dates by (year, month), takes the latest date in each
+    group as that month's "monthly," and returns the nearest one that
+    hasn't already passed as_of_date.
+
+    Returns None if expiry_dates is empty or nothing parses.
+    """
+    parsed = []
+    for d in expiry_dates:
+        try:
+            dt = datetime.strptime(d, "%d-%b-%Y").date()
+            parsed.append((dt, d))
+        except (ValueError, TypeError):
+            continue
+    if not parsed:
+        return None
+
+    monthly_by_year_month = {}
+    for dt, original in parsed:
+        key = (dt.year, dt.month)
+        if key not in monthly_by_year_month or dt > monthly_by_year_month[key][0]:
+            monthly_by_year_month[key] = (dt, original)
+
+    monthlies = sorted(monthly_by_year_month.values())
+    for dt, original in monthlies:
+        if dt >= as_of_date:
+            return original
+    return monthlies[-1][1]  # everything's in the past (shouldn't happen); best effort
+
+
+# ---------------------------------------------------------------------------
+# Index snapshot (day OHLC for all indices + India VIX) -- confirmed
+# reliable from both cloud and residential IPs throughout debugging.
+# ---------------------------------------------------------------------------
 
 def fetch_index_snapshot_raw() -> dict:
-    """Single call covering day OHLC for all indices plus India VIX."""
-    url = "https://www.nseindia.com/api/allIndices"
-    return _retry(nsefetch, url, what="all_indices")
+    return _get_json(ALL_INDICES_URL, what="all_indices")
 
 
 def parse_index_snapshot(raw: dict, symbol: str) -> dict:
-    """Returns {open, high, low, prev_close, last} for one of our tracked
-    symbols, pulled from the allIndices response. Returns a dict of Nones
-    if the display name isn't found (logged by the caller)."""
     target_name = INDEX_DISPLAY_NAME.get(symbol)
     return _extract_index_row(raw, target_name)
 
@@ -154,7 +296,7 @@ def parse_india_vix(raw: dict) -> dict:
 
 def _extract_index_row(raw: dict, target_name: str) -> dict:
     empty = {"open": None, "high": None, "low": None, "prev_close": None, "last": None}
-    if not target_name:
+    if not raw or not target_name:
         return empty
     for row in raw.get("data", []):
         name = (row.get("index") or row.get("indexSymbol") or "").strip().upper()
