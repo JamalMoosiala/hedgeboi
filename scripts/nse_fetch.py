@@ -105,6 +105,14 @@ def _get_session() -> requests.Session:
     up by visiting the option-chain page first, exactly like the bhavcopy
     downloader visits the homepage first -- this is what actually
     populates the cookies NSE's API checks for.
+
+    IMPORTANT: the warm-up is wrapped in its own try/except and always
+    results in a cached session, even on failure. Without this, a single
+    slow/failed warm-up would silently retry on EVERY subsequent call in
+    the same run (since _session would stay None), with no logging and
+    no retry cap -- eating potentially minutes of runtime with zero
+    visibility. Better to log it once, proceed without fresh cookies, and
+    let the actual API calls' own retry logic handle any consequences.
     """
     global _session
     if _session is not None:
@@ -112,26 +120,37 @@ def _get_session() -> requests.Session:
 
     session = requests.Session()
     session.headers.update(BASE_HEADERS)
-    session.get(WARMUP_URL, timeout=15)
-    _session = session
+    try:
+        session.get(WARMUP_URL, timeout=15)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [warmup] WARNING: session warm-up request failed ({exc}); "
+              f"proceeding without fresh cookies for this run.")
+    _session = session  # cache regardless, so this can't retry unboundedly
     return _session
 
 
 def _retry(fn, *args, what: str, **kwargs):
     """Generic retry wrapper with exponential backoff, plus a politeness
-    pause after every successful call (see SLEEP_BETWEEN_CALLS_SECONDS)."""
+    pause after every successful call (see SLEEP_BETWEEN_CALLS_SECONDS).
+    Logs how long the call actually took -- makes a slow-but-not-failing
+    NSE response visible in the logs instead of just showing up as
+    unexplained total run duration."""
     last_exc = None
     for attempt in range(1, MAX_RETRIES + 1):
+        start = time.monotonic()
         try:
             result = fn(*args, **kwargs)
+            elapsed = time.monotonic() - start
+            print(f"  [{what}] ok in {elapsed:.1f}s")
             time.sleep(SLEEP_BETWEEN_CALLS_SECONDS)
             return result
         except Exception as exc:  # noqa: BLE001
+            elapsed = time.monotonic() - start
             last_exc = exc
             if attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
-                print(f"  [{what}] attempt {attempt}/{MAX_RETRIES} failed "
-                      f"({exc}); retrying in {wait}s...")
+                print(f"  [{what}] attempt {attempt}/{MAX_RETRIES} failed after "
+                      f"{elapsed:.1f}s ({exc}); retrying in {wait}s...")
                 time.sleep(wait)
     raise last_exc
 
@@ -295,7 +314,8 @@ def parse_india_vix(raw: dict) -> dict:
 
 
 def _extract_index_row(raw: dict, target_name: str) -> dict:
-    empty = {"open": None, "high": None, "low": None, "prev_close": None, "last": None}
+    empty = {"open": None, "high": None, "low": None, "prev_close": None,
+             "last": None, "dy": None}
     if not raw or not target_name:
         return empty
     for row in raw.get("data", []):
@@ -307,5 +327,15 @@ def _extract_index_row(raw: dict, target_name: str) -> dict:
                 "low": row.get("low") or row.get("dayLow"),
                 "prev_close": row.get("previousClose"),
                 "last": row.get("last") or row.get("lastPrice"),
+                # NSE's own published dividend yield for this index, as a
+                # percentage string (e.g. "1.18" means 1.18%). This is the
+                # PRIMARY source for the dividend yield fed into the
+                # Greeks -- see run_fetch.py's get_dividend_yield_and_carry().
+                # It's a slow-moving, NSE-published number, unlike a
+                # per-cycle futures-basis calculation, which can blow up
+                # to nonsensical values for near-expiry contracts (see
+                # README "Data source history" for the concrete example
+                # that motivated this switch).
+                "dy": row.get("dy"),
             }
     return empty
