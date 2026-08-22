@@ -31,6 +31,7 @@ Design principles baked in here (per everything discussed building this):
 
 import math
 import sys
+import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -66,15 +67,42 @@ def years_to_expiry(expiry_str: str, as_of: datetime) -> float:
     return max(delta, 0.0) / (365.0 * 24 * 3600)
 
 
-def get_cost_of_carry(futures_by_expiry: dict, expiry_date: str, S: float, T: float):
-    """Returns (implied_cost_of_carry, dividend_yield_used, source)."""
+def get_dividend_yield_and_carry(futures_by_expiry: dict, expiry_date: str,
+                                  S: float, T: float, index_dy_pct):
+    """
+    Returns (q_used, dividend_yield_source, implied_cost_of_carry, futures_price).
+
+    q_used is sourced from the underlying INDEX'S OWN published dividend
+    yield (index_dy_pct, from allIndices' "dy" field) whenever available --
+    a slow-moving, NSE-published number. This replaced an earlier design
+    that derived q from the futures-basis formula (b = ln(F/S)/T): that
+    approach blows up for near-expiry contracts, since dividing by a tiny
+    T annualizes even normal basis noise into an extreme rate (confirmed
+    live: a 4-day-to-expiry NIFTY strike showed an implied cost-of-carry
+    of 20%+ and a dividend yield of -14%, which then distorted every
+    Greek). The index's own published yield has no such T-dependency.
+
+    futures_price / implied_cost_of_carry are still computed and returned
+    when a futures price is available for this expiry -- purely as
+    informational/diagnostic columns now, not used to derive q.
+    """
     F = futures_by_expiry.get(expiry_date)
+    b = None
     if F and S and T and T > 0:
         b = math.log(F / S) / T
-        q_implied = RISK_FREE_RATE - b
-        return b, q_implied, "futures_implied", F
-    b = RISK_FREE_RATE - FALLBACK_DIVIDEND_YIELD
-    return b, FALLBACK_DIVIDEND_YIELD, "static_fallback", None
+
+    if index_dy_pct is not None:
+        try:
+            q_used = float(index_dy_pct) / 100.0
+            source = "index_dividend_yield"
+        except (TypeError, ValueError):
+            q_used = FALLBACK_DIVIDEND_YIELD
+            source = "static_fallback"
+    else:
+        q_used = FALLBACK_DIVIDEND_YIELD
+        source = "static_fallback"
+
+    return q_used, source, b, F
 
 
 def classify_quote(bid, ask, mid) -> str:
@@ -233,7 +261,9 @@ def process_symbol(symbol: str, fetch_ts_utc: datetime, fetch_ts_ist: datetime,
         })
 
         # Real bid/ask are back -- prefer mid-price over LTP again, exactly
-        # like the original design intended.
+        # like the original design intended. Used here purely for the
+        # below-intrinsic-value guardrail now (see below), since we no
+        # longer solve our own IV from it -- Greeks use nse_iv directly.
         price_for_iv = mid if mid else (ltp if ltp else None)
         row["price_source_for_iv"] = "mid_price" if mid else ("ltp" if ltp else "none")
 
@@ -242,8 +272,17 @@ def process_symbol(symbol: str, fetch_ts_utc: datetime, fetch_ts_ist: datetime,
             rows.append(row)
             continue
 
-        b, q_used, carry_source, F = get_cost_of_carry(
-            futures_by_expiry, expiry_date, entry_underlying, T,
+        # Guardrail, preserved even without our own solver: a price below
+        # intrinsic value is a strong sign of a stale/bad quote, regardless
+        # of what IV NSE has published for it.
+        intrinsic = max(entry_underlying - strike, 0.0) if opt_type == "CE" else max(strike - entry_underlying, 0.0)
+        if price_for_iv < intrinsic - 1e-6:
+            row["data_quality_flag"] = "no_price_available"
+            rows.append(row)
+            continue
+
+        q_used, carry_source, b, F = get_dividend_yield_and_carry(
+            futures_by_expiry, expiry_date, entry_underlying, T, idx_ohlc.get("dy"),
         )
         row["futures_price"] = F
         row["implied_cost_of_carry"] = b
@@ -251,19 +290,25 @@ def process_symbol(symbol: str, fetch_ts_utc: datetime, fetch_ts_ist: datetime,
         row["dividend_yield_source"] = carry_source
         row["risk_free_rate_used"] = RISK_FREE_RATE
 
-        iv = greeks.implied_vol(
-            price_for_iv, entry_underlying, strike, T,
-            RISK_FREE_RATE, q_used, opt_type,
-        )
-        row["computed_iv"] = iv
+        # Greeks now use NSE's own published IV directly -- no in-house
+        # solver in the loop. nse_iv arrives as a percentage (e.g. 8.8
+        # means 8.8%), so it's converted to decimal here.
+        sigma = None
+        if nse_iv is not None:
+            try:
+                candidate = float(nse_iv) / 100.0
+                if candidate > 0:
+                    sigma = candidate
+            except (TypeError, ValueError):
+                sigma = None
 
-        if iv is None:
-            row["data_quality_flag"] = "no_price_available"
+        if sigma is None:
+            row["data_quality_flag"] = "no_nse_iv"
             rows.append(row)
             continue
 
         g = greeks.compute_all_greeks(
-            entry_underlying, strike, T, RISK_FREE_RATE, q_used, iv, opt_type,
+            entry_underlying, strike, T, RISK_FREE_RATE, q_used, sigma, opt_type,
         )
         row.update(g)
         row["data_quality_flag"] = classify_quote(bid or None, ask or None, mid)
@@ -275,6 +320,7 @@ def process_symbol(symbol: str, fetch_ts_utc: datetime, fetch_ts_ist: datetime,
 
 
 def main():
+    run_start = time.monotonic()
     fetch_ts_utc = datetime.now(timezone.utc)
     fetch_ts_ist = fetch_ts_utc.astimezone(IST)
     today = fetch_ts_ist.date()
@@ -297,7 +343,6 @@ def main():
                     f"({exc}); those columns will be null for this cycle.")
 
     any_symbol_succeeded = False
-    all_main_rows = []
 
     for symbol in SYMBOLS:
         print(f"Processing {symbol}...")
@@ -324,12 +369,12 @@ def main():
         except Exception as exc:  # noqa: BLE001
             gha_warning(f"[{symbol}] raw archive write failed: {exc} (MAIN rows still kept)")
 
-        all_main_rows.extend(rows)
+        # Each symbol gets its OWN MAIN file (vault/tables/<SYMBOL>/MAIN-*.csv)
+        # -- written immediately per symbol, not accumulated and merged
+        # across symbols into one shared file.
+        vault_io.append_main_rows(symbol, today, rows)
         any_symbol_succeeded = True
-        print(f"  [{symbol}] {len(rows)} rows ready for MAIN table.")
-
-    if all_main_rows:
-        vault_io.append_main_rows(today, all_main_rows)
+        print(f"  [{symbol}] {len(rows)} rows written to its own MAIN table.")
 
     if not any_symbol_succeeded:
         gha_error("No symbol produced usable data this cycle. Check NSE endpoint "
@@ -338,6 +383,9 @@ def main():
         # scheduled workflow (retries + the next cycle will likely recover).
         # The ::error:: annotation above still makes this visible in the
         # Actions run summary.
+
+    total_elapsed = time.monotonic() - run_start
+    print(f"Fetch cycle finished in {total_elapsed:.1f}s total.")
     sys.exit(0)
 
 
