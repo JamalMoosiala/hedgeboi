@@ -3,10 +3,10 @@ vault_io.py
 
 Handles everything that touches disk under vault/:
 
-    vault/raw/<SYMBOL>/JSON-DD-MM-YYYY.json.gz   -- one growing file per
+    vault/raw/<SYMBOL>/JSON-YYYY-MM-DD.json.gz   -- one growing file per
         symbol per day; each fetch cycle appends one more entry to a list
         inside the (re-written) gzip file.
-    vault/tables/<SYMBOL>/MAIN-DD-MM-YYYY.csv    -- one growing file per
+    vault/tables/<SYMBOL>/MAIN-YYYY-MM-DD.csv    -- one growing file per
         symbol per day, one row per strike/expiry/option-type per fetch
         cycle. Each symbol gets its OWN file -- this used to be merged
         into a single shared daily file across all symbols, which was
@@ -71,12 +71,17 @@ CSV_COLUMNS = [
     "underlying_prev_close",
     "price_source_for_iv",
     "data_quality_flag",
+    # poller_id: which poller produced this row (Phase 1). Static
+    # "gh-actions" for now, env-overridable via POLLER_ID -- lets multiple
+    # pollers write into the same schema without colliding on identity.
+    "poller_id",
 ]
 
 
 def date_stamp(d) -> str:
-    """DD-MM-YYYY, zero-padded, for filenames."""
-    return d.strftime("%d-%m-%Y")
+    """YYYY-MM-DD, zero-padded, for filenames -- chosen so files sort
+    correctly as plain text (lexicographic order == chronological order)."""
+    return d.strftime("%Y-%m-%d")
 
 
 # ---------------------------------------------------------------------------

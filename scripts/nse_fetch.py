@@ -43,6 +43,8 @@ from datetime import datetime
 
 import requests
 
+import config_loader
+
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE_SECONDS = 3  # 3s, 6s, 12s...
 SLEEP_BETWEEN_CALLS_SECONDS = 2  # politeness delay after every successful call
@@ -74,27 +76,17 @@ ALL_INDICES_URL = "https://www.nseindia.com/api/allIndices"
 # response or a block. It used to be this pipeline's source for both
 # futures prices AND lot size. Futures now come from
 # parse_futures_from_entries() (see above, uses the option-chain response
-# itself). Lot size has NO live source at all anymore -- LOT_SIZE_FALLBACK
-# below is the only source, full stop, until/unless a replacement
-# endpoint is found.
+# itself). Lot size has NO live source at all anymore -- the
+# lot_size_fallback in config/symbols.yaml is the only source, full stop,
+# until/unless a replacement endpoint is found.
 
-# Fallback lot sizes -- current as of the January 2026 NSE revision
-# (NIFTY 65, BANKNIFTY 30, NIFTYNXT50 25). Re-check
-# https://www.nseindia.com/all-reports-derivatives periodically and
-# update this table when NSE next revises lot sizes, since there's no
-# longer any live endpoint to catch a revision automatically.
-LOT_SIZE_FALLBACK = {
-    "NIFTY": 65,
-    "BANKNIFTY": 30,
-    "NIFTYNXT50": 25,
-}
-
-INDEX_DISPLAY_NAME = {
-    "NIFTY": "NIFTY 50",
-    "BANKNIFTY": "NIFTY BANK",
-    "NIFTYNXT50": "NIFTY NEXT 50",
-}
-INDIA_VIX_DISPLAY_NAME = "INDIA VIX"
+# Lot sizes, index display names, and the India VIX display name all now
+# live in config/symbols.yaml, read via config_loader -- they used to be
+# hardcoded here. Lot size still has NO live source (the quote-derivative
+# endpoint is dead), so the config's lot_size_fallback is the only source;
+# re-check https://www.nseindia.com/all-reports-derivatives periodically and
+# update symbols.yaml when NSE next revises lot sizes, since there's no
+# live endpoint to catch a revision automatically.
 
 _session = None  # module-level, lazily created, reused across all calls in a run
 
@@ -305,12 +297,12 @@ def fetch_index_snapshot_raw() -> dict:
 
 
 def parse_index_snapshot(raw: dict, symbol: str) -> dict:
-    target_name = INDEX_DISPLAY_NAME.get(symbol)
+    target_name = config_loader.index_display_name(symbol)
     return _extract_index_row(raw, target_name)
 
 
 def parse_india_vix(raw: dict) -> dict:
-    return _extract_index_row(raw, INDIA_VIX_DISPLAY_NAME)
+    return _extract_index_row(raw, config_loader.india_vix_display_name())
 
 
 def _extract_index_row(raw: dict, target_name: str) -> dict:

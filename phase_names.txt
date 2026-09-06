@@ -1,0 +1,48 @@
+**Phase 1 — Repo skeleton + config + schema**
+- `symbols.yaml`
+- `schema.py`
+- Filename format fix (`YYYY-MM-DD`)
+- `poller_id` column
+- Repo/vault structure kept portable
+
+**Phase 2 — Concurrent fetch + speed**
+- Parallel symbol fetch
+- Kill the flat 2s sleep
+- Warm session before spawning threads
+
+**Phase 3 — Shard-per-cycle parquet storage**
+- CSV → parquet
+- Shard-per-cycle writes
+- Idempotent shard naming
+- `.gitattributes` for `*.parquet`
+- `totalBuyQuantity`/`totalSellQuantity` columns
+
+**Phase 4 — Compaction + query helper**
+- DuckDB compaction
+- Compaction safety
+- `scripts/query.py`
+
+**Phase 5 — Data quality layer**
+- Put-call parity check
+- Smile monotonicity/convexity check
+- Unit tests for `greeks.py`
+- Lookahead-bias discipline
+
+**Phase 6 — Replay-from-raw + versioning**
+- `scripts/rebuild_table.py`
+- `algo_version` column
+- Pinned dependency lockfile
+
+**Phase 7 — Multi-expiry + partitioning**
+- Tiered fetch policy
+- Expiry-outer/date-inner partitioning
+- Two-tier compaction
+- Realized-vol backfill
+- Term-structure/skew summary table
+
+**Phase 8 — Operations, monitoring, resilience**
+- Structured logs
+- Per-cycle operational metrics table
+- Circuit breaker
+- Gap-checker
+
