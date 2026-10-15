@@ -30,11 +30,13 @@ Design principles baked in here (per everything discussed building this):
 """
 
 import math
+import os
 import sys
 import time
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import config_loader
 import greeks
 import holidays
 import nse_fetch
@@ -42,7 +44,10 @@ import vault_io
 
 IST = ZoneInfo("Asia/Kolkata")
 
-SYMBOLS = ["NIFTY", "BANKNIFTY", "NIFTYNXT50"]
+# Which poller produced these rows. Static default for the GitHub Actions
+# runner; env-overridable so a different poller (local, another CI) tags its
+# rows distinctly without a code change.
+POLLER_ID = os.environ.get("POLLER_ID", "gh-actions")
 
 RISK_FREE_RATE = 0.065          # static assumption; only affects discounting
                                   # once cost-of-carry is futures-implied
@@ -203,7 +208,7 @@ def process_symbol(symbol: str, fetch_ts_utc: datetime, fetch_ts_ist: datetime,
                     f"expiry {target_expiry} -- this symbol will fail its freshness "
                     f"check this cycle.")
 
-    lot_size = nse_fetch.LOT_SIZE_FALLBACK.get(symbol)  # no live source exists anymore
+    lot_size = config_loader.lot_size(symbol)  # no live source exists anymore
 
     idx_ohlc = nse_fetch.parse_index_snapshot(index_snapshot_raw, symbol) if index_snapshot_raw else {}
     india_vix_row = nse_fetch.parse_india_vix(index_snapshot_raw) if index_snapshot_raw else {}
@@ -236,6 +241,7 @@ def process_symbol(symbol: str, fetch_ts_utc: datetime, fetch_ts_ist: datetime,
             "fetch_ts_utc": fetch_ts_utc.isoformat(),
             "fetch_ts_ist": fetch_ts_ist.isoformat(),
             "symbol": symbol,
+            "poller_id": POLLER_ID,
             "expiry_date": expiry_date,
             "strike": strike,
             "option_type": opt_type,
@@ -344,7 +350,7 @@ def main():
 
     any_symbol_succeeded = False
 
-    for symbol in SYMBOLS:
+    for symbol in config_loader.symbol_names():
         print(f"Processing {symbol}...")
         try:
             rows, snapshot = process_symbol(symbol, fetch_ts_utc, fetch_ts_ist, index_snapshot_raw)

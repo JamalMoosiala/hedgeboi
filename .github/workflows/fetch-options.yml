@@ -12,7 +12,12 @@ on:
     - cron: "45,50,55 3 * * 1-5"
     - cron: "*/5 4-9 * * 1-5"
     - cron: "0,5,10,15,20,25,30 10 * * 1-5"
-  workflow_dispatch: {}   # manual trigger from the Actions tab, for testing
+  workflow_dispatch:      # manual trigger from the Actions tab, for testing
+    inputs:
+      symbols:
+        description: "Comma-separated subset to poll (e.g. NIFTY,BANKNIFTY). Blank = all symbols in config/symbols.yaml."
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -48,6 +53,11 @@ jobs:
         # cycle, so this outer retry mainly guards against runner-level
         # issues (network blip on the Actions runner itself, etc.).
         uses: nick-fields/retry@v3
+        env:
+          # Empty on scheduled runs -> config_loader polls all symbols.
+          # On a manual run, the workflow_dispatch `symbols` input narrows
+          # the set without editing symbols.yaml.
+          NSE_SYMBOLS: ${{ github.event.inputs.symbols }}
         with:
           timeout_minutes: 5
           max_attempts: 2
